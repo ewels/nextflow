@@ -4,6 +4,8 @@
 Processes
 *********
 
+This is a mock-change, to test the CI setup for docs-only PRs.
+
 In Nextflow, a **process** is the basic processing primitive to execute a user script.
 
 The process definition starts with the keyword ``process``, followed by process name and finally the process body
@@ -69,7 +71,7 @@ scripts with multiple commands spanning multiple lines. For example::
 
     process doMoreThings {
       shell '/bin/bash', '-euo', 'pipefail'
-      
+
       """
       blastp -db $db -query query.fa -outfmt 6 > blast_result
       cat blast_result | head -n 10 | cut -f 2 > top_hits
@@ -894,8 +896,6 @@ It outputs::
 
 See also: :ref:`channel-types`.
 
-
-.. _process-output:
 
 Outputs
 =======
