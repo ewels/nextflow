@@ -289,7 +289,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         ColorUtil.printColored("Personal Access Token saved to Nextflow auth config (${getAuthFile().toString()})", "green")
     }
 
-    private String getWebUrlFromApiEndpoint(String apiEndpoint) {
+    protected String getWebUrlFromApiEndpoint(String apiEndpoint) {
         // Convert API endpoint to web URL
         // e.g., https://api.cloud.seqera.io -> https://cloud.seqera.io
         //      https://cloud.seqera.io/api -> https://cloud.seqera.io
@@ -777,7 +777,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         return [changed: currentId != selectedId, metadata: metadata]
     }
 
-    private List getUserWorkspaces(String accessToken, String endpoint, String userId) {
+    protected List getUserWorkspaces(String accessToken, String endpoint, String userId) {
         final client = createHttpClient(accessToken)
         final request = HttpRequest.newBuilder()
             .uri(URI.create("${endpoint}/user/${userId}/workspaces"))
@@ -1073,7 +1073,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         tableLines.each { println it }
     }
 
-    private List<String> generateStatusTableLines(List<List<String>> rows) {
+    protected List<String> generateStatusTableLines(List<List<String>> rows) {
         if( !rows ) return []
 
         final List<String> lines = []
@@ -1267,7 +1267,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         }
     }
 
-    private Map readConfig() {
+    protected Map readConfig() {
         final builder = new ConfigBuilder().setHomeDir(Const.APP_HOME_DIR).setCurrentDir(Const.APP_HOME_DIR)
         return builder.buildConfigObject().flatten()
     }

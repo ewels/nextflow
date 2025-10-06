@@ -54,6 +54,9 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     static final private String DEFAULT_API_ENDPOINT = 'https://api.cloud.seqera.io'
     static final int API_TIMEOUT_MS = 10000
 
+    // Delegate to AuthCommandImpl for shared authentication and API functionality
+    private final AuthCommandImpl authHelper = new AuthCommandImpl()
+
     @Override
     void launch(CmdLaunch.LaunchOptions options) {
         printBanner(options)
@@ -74,7 +77,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         log.debug "Resolved pipeline URL: ${resolvedPipelineUrl}"
 
         // Load configuration to get authentication and endpoint
-        final config = readConfig()
+        final config = authHelper.readConfig()
         final apiEndpoint = (config['tower.endpoint'] ?: DEFAULT_API_ENDPOINT) as String
         final accessToken = config['tower.accessToken'] as String
 
@@ -201,7 +204,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
         // Construct and display tracking URL
         def trackingUrl = null
-        final webUrl = apiEndpointToWebUrl(apiEndpoint)
+        final webUrl = authHelper.getWebUrlFromApiEndpoint(apiEndpoint)
         if (response.workflowId && orgName && workspaceName) {
             trackingUrl = "${webUrl}/orgs/${orgName}/workspaces/${workspaceName}/watch/${response.workflowId}/"
         } else if (response.workflowId && userName) {
@@ -477,16 +480,6 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
      *   https://api.cloud.stage-seqera.io -> https://cloud.stage-seqera.io
      *   https://tower.example.com/api -> https://tower.example.com
      */
-    private static String apiEndpointToWebUrl(String apiEndpoint) {
-        // Remove /api suffix if present
-        def webUrl = apiEndpoint.replaceFirst('/api$', '')
-
-        // Convert api.cloud.* pattern to cloud.* pattern
-        webUrl = webUrl.replaceFirst('://api\\.', '://')
-
-        return webUrl
-    }
-
     private String buildParamsText(Map<String, String> params, String paramsFile) {
         final result = [:]
 
@@ -662,20 +655,9 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
     // ===== API Helper Methods =====
 
-    protected HxClient createHttpClient(String authToken = null) {
-        final builder = HxClient.newBuilder()
-            .connectTimeout(Duration.ofMillis(API_TIMEOUT_MS))
-
-        if (authToken) {
-            builder.bearerToken(authToken)
-        }
-
-        return builder.build()
-    }
-
     protected Map apiGet(String path, Map queryParams = [:], String accessToken, String apiEndpoint) {
         final url = buildUrl(apiEndpoint, path, queryParams)
-        final client = createHttpClient(accessToken)
+        final client = authHelper.createHttpClient(accessToken)
         final request = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .GET()
@@ -694,7 +676,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     protected Map apiPost(String path, Map body, Map queryParams = [:], String accessToken, String apiEndpoint) {
         final url = buildUrl(apiEndpoint, path, queryParams)
         final requestBody = new JsonBuilder(body).toString()
-        final client = createHttpClient(accessToken)
+        final client = authHelper.createHttpClient(accessToken)
         final request = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .header('Content-Type', 'application/json')
@@ -726,11 +708,6 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         return url.toString()
     }
 
-    private Map readConfig() {
-        final builder = new ConfigBuilder()
-        return builder.buildConfigObject().flatten()
-    }
-
     private Long resolveWorkspaceId(Map config, String workspaceName, String accessToken, String apiEndpoint) {
         // First check config for workspace ID
         final configWorkspaceId = config['tower.workspaceId']
@@ -741,83 +718,36 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         // If workspace name provided, look it up
         if (workspaceName) {
             final userId = getUserId(accessToken, apiEndpoint)
-            final workspaces = getUserWorkspaces(accessToken, apiEndpoint, userId)
-            final workspace = workspaces.find { ((Map) it).workspaceName == workspaceName }
-            if (workspace) {
-                return ((Map) workspace).workspaceId as Long
+            final workspaces = authHelper.getUserWorkspaces(accessToken, apiEndpoint, userId)
+
+            final matchingWorkspace = workspaces.find { workspace ->
+                final ws = workspace as Map
+                final wsName = ws.workspaceName as String
+                wsName == workspaceName
             }
-            throw new AbortOperationException("Workspace '${workspaceName}' not found")
+
+            if (!matchingWorkspace) {
+                throw new AbortOperationException("Workspace '${workspaceName}' not found")
+            }
+
+            return (matchingWorkspace as Map).workspaceId as Long
         }
 
         return null
     }
 
     private String getUserName(String accessToken, String apiEndpoint) {
-        final userInfo = callUserInfoApi(accessToken, apiEndpoint)
+        final userInfo = authHelper.callUserInfoApi(accessToken, apiEndpoint)
         return userInfo.userName as String
     }
 
     private String getUserId(String accessToken, String apiEndpoint) {
-        final userInfo = callUserInfoApi(accessToken, apiEndpoint)
+        final userInfo = authHelper.callUserInfoApi(accessToken, apiEndpoint)
         return userInfo.id as String
     }
 
-    private Map callUserInfoApi(String accessToken, String apiEndpoint) {
-        final client = createHttpClient(accessToken)
-        final request = HttpRequest.newBuilder()
-            .uri(URI.create("${apiEndpoint}/user-info"))
-            .GET()
-            .build()
-
-        final response = client.send(request, HttpResponse.BodyHandlers.ofString())
-
-        if (response.statusCode() != 200) {
-            final error = response.body() ?: "HTTP ${response.statusCode()}"
-            throw new RuntimeException("Failed to get user info: ${error}")
-        }
-
-        final json = new JsonSlurper().parseText(response.body()) as Map
-        return json.user as Map
-    }
-
-    private List getUserWorkspaces(String accessToken, String apiEndpoint, String userId) {
-        final client = createHttpClient(accessToken)
-        final request = HttpRequest.newBuilder()
-            .uri(URI.create("${apiEndpoint}/user/${userId}/workspaces"))
-            .GET()
-            .build()
-
-        final response = client.send(request, HttpResponse.BodyHandlers.ofString())
-
-        if (response.statusCode() != 200) {
-            final error = response.body() ?: "HTTP ${response.statusCode()}"
-            throw new RuntimeException("Failed to get workspaces: ${error}")
-        }
-
-        final json = new JsonSlurper().parseText(response.body()) as Map
-        final orgsAndWorkspaces = json.orgsAndWorkspaces as List
-
-        return orgsAndWorkspaces.findAll { ((Map) it).workspaceId != null }
-    }
-
     private Map getWorkspaceDetails(String accessToken, String apiEndpoint, Long workspaceId) {
-        try {
-            final userId = getUserId(accessToken, apiEndpoint)
-            final workspaces = getUserWorkspaces(accessToken, apiEndpoint, userId)
-            final workspace = workspaces.find { ((Map) it).workspaceId?.toString() == workspaceId?.toString() }
-            if (workspace) {
-                final ws = workspace as Map
-                return [
-                    orgName: ws.orgName,
-                    workspaceName: ws.workspaceName,
-                    workspaceFullName: ws.workspaceFullName
-                ]
-            }
-            return null
-        } catch (Exception e) {
-            log.debug "Failed to get workspace details: ${e.message}"
-            return null
-        }
+        return authHelper.getWorkspaceDetailsFromApi(accessToken, apiEndpoint, workspaceId.toString())
     }
 
     private Map findComputeEnv(String computeEnvName, Long workspaceId, String accessToken, String apiEndpoint) {
@@ -839,7 +769,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     private List getComputeEnvs(Long workspaceId, String accessToken, String apiEndpoint) {
         def path = workspaceId ? "/compute-envs?workspaceId=${workspaceId}" : "/compute-envs"
 
-        final client = createHttpClient(accessToken)
+        final client = authHelper.createHttpClient(accessToken)
         final request = HttpRequest.newBuilder()
             .uri(URI.create("${apiEndpoint}${path}"))
             .GET()
