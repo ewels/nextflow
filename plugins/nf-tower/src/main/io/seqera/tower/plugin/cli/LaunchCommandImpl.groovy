@@ -49,34 +49,103 @@ import java.util.regex.Pattern
 @CompileStatic
 class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
+    // ===== Constants =====
+
     static final public List<String> VALID_PARAMS_FILE = ['json', 'yml', 'yaml']
     static final private Pattern DOT_ESCAPED = ~/\\\./
     static final private Pattern DOT_NOT_ESCAPED = ~/(?<!\\)\./
     static final int API_TIMEOUT_MS = 10000
+    static final int LOG_POLL_INTERVAL_MS = 2000
+    static final int LOG_GRACE_PERIOD_MS = 5000
+    static final int LOG_SLEEP_INTERVAL_MS = 100
 
     // Delegate to AuthCommandImpl for shared authentication and API functionality
     private final AuthCommandImpl authHelper = new AuthCommandImpl()
+
+    // ===== Data Classes =====
+
+    /**
+     * Holds all context needed for launching a workflow
+     */
+    @groovy.transform.Canonical
+    static class LaunchContext {
+        String accessToken
+        String apiEndpoint
+        String userName
+        Long workspaceId
+        String orgName
+        String workspaceName
+        String computeEnvId
+        String computeEnvName
+        String workDir
+    }
+
+    /**
+     * Holds the result of a workflow launch
+     */
+    @groovy.transform.Canonical
+    static class WorkflowLaunchResult {
+        String workflowId
+        String runName
+        String commitId
+        String revision
+        String repository
+        String trackingUrl
+    }
+
+    // ===== Main Entry Point =====
 
     @Override
     void launch(CmdLaunch.LaunchOptions options) {
         printBanner(options)
 
-        log.debug "Executing 'nextflow launch' command"
+        // Validate and resolve pipeline
+        final resolvedPipelineUrl = validateAndResolvePipeline(options.pipeline)
 
-        final pipeline = options.pipeline
+        // Initialize launch context with auth and workspace info
+        final context = initializeLaunchContext(options)
+
+        // Build and submit the launch request
+        final result = submitWorkflowLaunch(options, context, resolvedPipelineUrl)
+
+        // Display launch information
+        printLaunchInfo(result.repository, result.runName, result.commitId, result.revision,
+                        context.workDir, context.computeEnvName, context.userName,
+                        context.orgName, context.workspaceName, options)
+        printSuccessMessage(result.workflowId, result.trackingUrl, options)
+
+        // Poll for workflow logs
+        if (result.workflowId) {
+            pollWorkflowLogs(result.workflowId, context.workspaceId, result.trackingUrl,
+                           context.accessToken, context.apiEndpoint, options)
+        }
+    }
+
+    // ===== Launch Phases =====
+
+    /**
+     * Validate pipeline path and resolve to full repository URL
+     */
+    private String validateAndResolvePipeline(String pipeline) {
         log.debug "Pipeline repository: ${pipeline}"
 
-        // Reject local file paths
         if (isLocalPath(pipeline)) {
             log.debug "Rejecting local file path: ${pipeline}"
             throw new AbortOperationException("Local file paths are not supported. Please provide a remote repository URL.")
         }
 
-        // Resolve repository URL using AssetManager (same as nextflow run)
-        String resolvedPipelineUrl = resolvePipelineUrl(pipeline)
-        log.debug "Resolved pipeline URL: ${resolvedPipelineUrl}"
+        final resolvedUrl = resolvePipelineUrl(pipeline)
+        log.debug "Resolved pipeline URL: ${resolvedUrl}"
+        return resolvedUrl
+    }
 
-        // Load configuration to get authentication and endpoint
+    /**
+     * Initialize launch context by loading config and resolving workspace/compute environment
+     */
+    private LaunchContext initializeLaunchContext(CmdLaunch.LaunchOptions options) {
+        log.debug "Initializing launch context"
+
+        // Load configuration
         final config = authHelper.readConfig()
         final apiEndpoint = (config['tower.endpoint'] ?: TowerClient.DEF_ENDPOINT_URL) as String
         final accessToken = config['tower.accessToken'] as String
@@ -85,7 +154,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
             throw new AbortOperationException("No authentication found. Please run 'nextflow auth login' first.")
         }
 
-        // Get workspace info
+        // Resolve workspace
         final workspaceId = resolveWorkspaceId(config, options.workspace, accessToken, apiEndpoint)
         final userName = getUserName(accessToken, apiEndpoint)
 
@@ -100,124 +169,157 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
             log.debug "Using personal workspace for user: ${userName}"
         }
 
-        // Find compute environment
-        log.debug "Looking up compute environment: ${options.computeEnv ?: '(primary)'}"
-        def computeEnvInfo = findComputeEnv(options.computeEnv, workspaceId, accessToken, apiEndpoint)
-        if (!computeEnvInfo) {
-            if (options.computeEnv) {
-                throw new AbortOperationException("Compute environment '${options.computeEnv}' not found")
-            } else {
-                throw new AbortOperationException("No primary compute environment found")
-            }
-        }
-        String computeEnvId = computeEnvInfo.id as String
+        // Resolve compute environment
+        final computeEnvInfo = resolveComputeEnvironment(options.computeEnv, workspaceId, accessToken, apiEndpoint)
+        final workDir = resolveWorkDirectory(options.workDir, computeEnvInfo)
 
-        log.debug "Using compute environment: '${computeEnvInfo.name}' (ID: ${computeEnvId})"
+        return new LaunchContext(
+            accessToken: accessToken,
+            apiEndpoint: apiEndpoint,
+            userName: userName,
+            workspaceId: workspaceId,
+            orgName: orgName,
+            workspaceName: workspaceName,
+            computeEnvId: computeEnvInfo.id as String,
+            computeEnvName: computeEnvInfo.name as String,
+            workDir: workDir
+        )
+    }
 
-        // Use compute environment workDir if not specified on CLI
-        String workDir = options.workDir
-        if (!workDir && computeEnvInfo.workDir) {
-            workDir = computeEnvInfo.workDir as String
-        }
-        if (!workDir) {
-            throw new AbortOperationException("Work directory is required. Please specify -w/--work-dir or ensure your compute environment has a workDir configured.")
-        }
+    /**
+     * Build launch request, submit to API, and return result
+     */
+    private WorkflowLaunchResult submitWorkflowLaunch(CmdLaunch.LaunchOptions options, LaunchContext context, String pipelineUrl) {
+        log.debug "Submitting workflow launch"
 
-        // Parse parameters
-        log.debug "Building parameters from CLI args and params file"
-        log.debug "CLI params provided: ${options.params}"
-        log.debug "Params file: ${options.paramsFile ?: 'none'}"
-        String paramsText = buildParamsText(options.params, options.paramsFile)
-        if (paramsText) {
-            log.debug "Generated params JSON (${paramsText.length()} chars)"
-        } else {
-            log.debug "No parameters specified"
-        }
+        // Build request payload
+        final paramsText = buildParamsText(options.params, options.paramsFile)
+        final configText = buildConfigText(options.configFiles)
+        final launchRequest = buildLaunchRequestPayload(options, context, pipelineUrl, paramsText, configText)
 
-        // Build config text
-        log.debug "Building configuration from config files"
-        log.debug "Config files: ${options.configFiles ?: 'none'}"
-        log.debug "Config profile: ${options.profile ?: 'none'}"
-        String configText = buildConfigText(options.configFiles)
-        if (configText) {
-            log.debug "Generated config text (${configText.length()} chars)"
-        } else {
-            log.debug "No configuration files specified"
-        }
+        // Submit to API
+        final queryParams = context.workspaceId ? [workspaceId: context.workspaceId.toString()] : [:]
+        final response = apiPost('/workflow/launch', launchRequest, queryParams, context.accessToken, context.apiEndpoint)
 
-        // Build launch request
+        // Fetch workflow details for accurate launch info
+        final workflowDetails = fetchWorkflowDetails(response.workflowId as String, context.workspaceId,
+                                                      context.accessToken, context.apiEndpoint)
+
+        // Extract and return launch result
+        return extractLaunchResult(response, workflowDetails, options, pipelineUrl, context)
+    }
+
+    /**
+     * Build the launch request payload
+     */
+    private Map buildLaunchRequestPayload(CmdLaunch.LaunchOptions options, LaunchContext context,
+                                          String pipelineUrl, String paramsText, String configText) {
         def launch = [:]
-        launch.computeEnvId = computeEnvId
-        launch.workDir = workDir
+        launch.computeEnvId = context.computeEnvId
+        launch.workDir = context.workDir
+        launch.pipeline = pipelineUrl
+        launch.resume = options.resume != null
+        launch.pullLatest = options.latest
+        launch.stubRun = options.stubRun
+
         if (options.runName) launch.runName = options.runName
-        launch.pipeline = resolvedPipelineUrl
         if (options.revision) launch.revision = options.revision
         if (options.profile) launch.configProfiles = options.profile
         if (configText) launch.configText = configText
         if (paramsText) launch.paramsText = paramsText
         if (options.mainScript) launch.mainScript = options.mainScript
         if (options.entryName) launch.entryName = options.entryName
-        launch.resume = options.resume != null
-        launch.pullLatest = options.latest
-        launch.stubRun = options.stubRun
 
-        def launchRequest = [launch: launch]
+        log.debug "Built launch request with ${launch.size()} parameters"
+        return [launch: launch]
+    }
 
-        log.debug "Built launch request with ${launchRequest.launch.size()} parameters"
+    /**
+     * Fetch workflow details from API if workflow ID is available
+     */
+    private Map fetchWorkflowDetails(String workflowId, Long workspaceId, String accessToken, String apiEndpoint) {
+        if (!workflowId) return null
 
-        // Submit launch request
-        def queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
-        if (workspaceId) {
-            log.debug "Submitting to workspace ID: ${workspaceId}"
-        } else {
-            log.debug "Submitting to personal workspace (no workspaceId specified)"
-        }
+        log.debug "Fetching workflow details for ID: ${workflowId}"
+        final queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
+        return apiGet("/workflow/${workflowId}", queryParams, accessToken, apiEndpoint)
+    }
 
-        def response = apiPost('/workflow/launch', launchRequest, queryParams, accessToken, apiEndpoint)
-
-        // Get workflow details to extract accurate launch information
-        def workflowDetails = null
-        if (response.workflowId) {
-            log.debug "Fetching workflow details for ID: ${response.workflowId}"
-            def workflowQueryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
-            workflowDetails = apiGet("/workflow/${response.workflowId}", workflowQueryParams, accessToken, apiEndpoint)
-        }
-
-        // Extract launch information from workflow details
-        def actualRunName = 'unknown'
+    /**
+     * Extract launch result from API response and workflow details
+     */
+    private WorkflowLaunchResult extractLaunchResult(Map response, Map workflowDetails,
+                                                     CmdLaunch.LaunchOptions options, String pipelineUrl, LaunchContext context) {
+        def runName = 'unknown'
         def commitId = 'unknown'
-        def actualRevision = options.revision
-        def actualRepo = resolvedPipelineUrl
+        def revision = options.revision
 
         if (workflowDetails?.workflow) {
-            def workflow = workflowDetails.workflow as Map
-            actualRunName = workflow.runName as String ?: options.runName ?: 'unknown'
+            final workflow = workflowDetails.workflow as Map
+            runName = workflow.runName as String ?: options.runName ?: 'unknown'
             commitId = workflow.commitId as String ?: 'unknown'
-            actualRevision = workflow.revision as String ?: options.revision
+            revision = workflow.revision as String ?: options.revision
         } else {
-            // Fallback to original data if workflow details not available
-            actualRunName = options.runName ?: 'unknown'
+            runName = options.runName ?: 'unknown'
         }
 
-        // Print launch info line
-        printLaunchInfo(actualRepo, actualRunName, commitId, actualRevision, workDir, computeEnvInfo.name as String, userName, orgName, workspaceName, options)
-
-        // Construct and display tracking URL
-        def trackingUrl = null
-        final webUrl = authHelper.getWebUrlFromApiEndpoint(apiEndpoint)
-        if (response.workflowId && orgName && workspaceName) {
-            trackingUrl = "${webUrl}/orgs/${orgName}/workspaces/${workspaceName}/watch/${response.workflowId}/"
-        } else if (response.workflowId && userName) {
-            trackingUrl = "${webUrl}/user/${userName}/watch/${response.workflowId}/"
-        }
-
-        printSuccessMessage(response.workflowId as String, trackingUrl, options)
-
-        // Poll for log messages if we have a workflow ID
+        // Build tracking URL
+        final webUrl = authHelper.getWebUrlFromApiEndpoint(context.apiEndpoint)
+        String trackingUrl = null
         if (response.workflowId) {
-            pollWorkflowLogs(response.workflowId as String, workspaceId, trackingUrl, accessToken, apiEndpoint, options)
+            if (context.orgName && context.workspaceName) {
+                trackingUrl = "${webUrl}/orgs/${context.orgName}/workspaces/${context.workspaceName}/watch/${response.workflowId}/"
+            } else if (context.userName) {
+                trackingUrl = "${webUrl}/user/${context.userName}/watch/${response.workflowId}/"
+            }
         }
+
+        return new WorkflowLaunchResult(
+            workflowId: response.workflowId as String,
+            runName: runName,
+            commitId: commitId,
+            revision: revision,
+            repository: pipelineUrl,
+            trackingUrl: trackingUrl
+        )
     }
+
+    // ===== Configuration & Resolution Methods =====
+
+    /**
+     * Resolve compute environment by name or get primary
+     */
+    private Map resolveComputeEnvironment(String computeEnvName, Long workspaceId, String accessToken, String apiEndpoint) {
+        log.debug "Looking up compute environment: ${computeEnvName ?: '(primary)'}"
+
+        def computeEnvInfo = findComputeEnv(computeEnvName, workspaceId, accessToken, apiEndpoint)
+        if (!computeEnvInfo) {
+            if (computeEnvName) {
+                throw new AbortOperationException("Compute environment '${computeEnvName}' not found")
+            } else {
+                throw new AbortOperationException("No primary compute environment found")
+            }
+        }
+
+        log.debug "Using compute environment: '${computeEnvInfo.name}' (ID: ${computeEnvInfo.id})"
+        return computeEnvInfo
+    }
+
+    /**
+     * Resolve work directory from CLI option or compute environment
+     */
+    private String resolveWorkDirectory(String cliWorkDir, Map computeEnvInfo) {
+        String workDir = cliWorkDir
+        if (!workDir && computeEnvInfo.workDir) {
+            workDir = computeEnvInfo.workDir as String
+        }
+        if (!workDir) {
+            throw new AbortOperationException("Work directory is required. Please specify -w/--work-dir or ensure your compute environment has a workDir configured.")
+        }
+        return workDir
+    }
+
+    // ===== Display Methods =====
 
     protected void printBanner(CmdLaunch.LaunchOptions options) {
         if (ColorUtil.isAnsiEnabled()) {
@@ -340,153 +442,195 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         }
     }
 
+    // ===== Log Polling Methods =====
+
     /**
      * Poll workflow logs until the workflow completes
      */
-    private void pollWorkflowLogs(String workflowId, Long workspaceId, String trackingUrl, String accessToken, String apiEndpoint, CmdLaunch.LaunchOptions options) {
+    private void pollWorkflowLogs(String workflowId, Long workspaceId, String trackingUrl,
+                                  String accessToken, String apiEndpoint, CmdLaunch.LaunchOptions options) {
         log.debug "Starting log polling for workflow ID: ${workflowId}"
 
-        def queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
-        def displayedLogCount = 0
-        def finalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'UNKNOWN'] as Set<String>
-        def firstLogReceived = false
-        def workflowFinished = false
-        def workflowFinishedTime = 0L
-
-        // Flag to signal when to stop polling
-        def shouldExit = new AtomicBoolean(false)
-
-        // Add shutdown hook to handle Ctrl+C
-        def shutdownHook = new Thread({
-            shouldExit.set(true)
-            log.debug "Shutdown hook triggered - setting exit flag"
-
-            // Print exit message
-            if (ColorUtil.isAnsiEnabled()) {
-                println ""
-                println "Exiting log viewer."
-                if (trackingUrl) {
-                    print(ColorUtil.colorize("⚠️ Workflow is still running in Seqera Platform: ", "yellow bold"))
-                    ColorUtil.printColored(trackingUrl, "cyan")
-                }
-            } else {
-                log.info "Exiting log viewer."
-                if (trackingUrl) {
-                    log.info "Workflow is still running in Seqera Platform: ${trackingUrl}"
-                }
-            }
-        })
+        final queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
+        final shouldExit = new AtomicBoolean(false)
+        final shutdownHook = createShutdownHook(shouldExit, trackingUrl)
 
         Runtime.getRuntime().addShutdownHook(shutdownHook)
-
-        // Initial message
-        if (ColorUtil.isAnsiEnabled()) {
-            print(ColorUtil.colorize("Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c", "dim"))
-        } else {
-            log.info "Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c"
-        }
+        printLogPollingStartMessage()
 
         try {
-            while (!shouldExit.get()) {
-                try {
-                    // Check workflow status
-                    def workflowResponse = apiGet("/workflow/${workflowId}", queryParams, accessToken, apiEndpoint)
-                    def workflow = workflowResponse.workflow as Map
-                    def status = workflow?.status as String
-
-                    log.debug "Workflow status: ${status}"
-
-                    // Poll the log endpoint for new entries
-                    def logResponse = apiGet("/workflow/${workflowId}/log", queryParams, accessToken, apiEndpoint)
-                    def logData = logResponse.log as Map
-
-                    if (logData) {
-                        def entries = logData.entries as List<String>
-
-                        // Display new log entries
-                        if (entries && entries.size() > displayedLogCount) {
-                            // Clear waiting message on first log entry
-                            if (!firstLogReceived) {
-                                firstLogReceived = true
-                                if (ColorUtil.isAnsiEnabled()) {
-                                    println ""
-                                    print('─' * 10)
-                                    println ""
-                                }
-                            }
-
-                            def newEntries = entries.subList(displayedLogCount, entries.size())
-                            for (String entry : newEntries) {
-                                if (shouldExit.get()) break
-                                println entry
-                            }
-                            displayedLogCount = entries.size()
-                        } else if (!firstLogReceived) {
-                            // Show progress dots while waiting
-                            if (ColorUtil.isAnsiEnabled()) {
-                                print(ColorUtil.colorize(".", "dim", true))
-                            }
-                            System.out.flush()
-                        }
-                    }
-
-                    // Check if workflow has reached a final status
-                    if (status && finalStatuses.contains(status)) {
-                        if (!workflowFinished) {
-                            log.debug "Workflow reached final status: ${status}, continuing to poll for 5 more seconds to capture remaining logs"
-                            workflowFinished = true
-                            workflowFinishedTime = System.currentTimeMillis()
-                        }
-                    }
-
-                    // Check if we should stop polling (5 seconds after workflow finished)
-                    if (workflowFinished && (System.currentTimeMillis() - workflowFinishedTime) > 5000) {
-                        log.debug "Grace period elapsed, stopping log polling"
-                        break
-                    }
-
-                    // Wait 2 seconds before next API poll
-                    for (int i = 0; i < 20 && !shouldExit.get(); i++) {
-                        Thread.sleep(100)
-                    }
-
-                } catch (Exception e) {
-                    if (shouldExit.get()) break
-                    log.error "Error polling workflow logs: ${e.message}", e
-                    // Continue polling despite errors (wait 2 seconds)
-                    for (int i = 0; i < 20 && !shouldExit.get(); i++) {
-                        Thread.sleep(100)
-                    }
-                }
-            }
+            runLogPollingLoop(workflowId, queryParams, accessToken, apiEndpoint, shouldExit)
         } finally {
-            // Remove shutdown hook if we exit normally
-            try {
-                Runtime.getRuntime().removeShutdownHook(shutdownHook)
-            } catch (IllegalStateException e) {
-                // Shutdown hook already executed, ignore
-            }
+            removeShutdownHook(shutdownHook)
         }
 
         log.debug "Log polling completed for workflow ID: ${workflowId}"
     }
 
-    private static boolean isLocalPath(String path) {
-        if (path.startsWith('/') || path.startsWith('./') || path.startsWith('../')) {
-            return true
-        }
-        if (path.contains('\\') || path ==~ /^[A-Za-z]:.*/) {
-            return true
-        }
-        return false
+    /**
+     * Create shutdown hook for graceful exit on Ctrl+C
+     */
+    private Thread createShutdownHook(AtomicBoolean shouldExit, String trackingUrl) {
+        return new Thread({
+            shouldExit.set(true)
+            log.debug "Shutdown hook triggered - setting exit flag"
+            printLogPollingExitMessage(trackingUrl)
+        })
     }
 
     /**
-     * Convert API endpoint URL to web UI URL
-     * Examples:
-     *   https://api.cloud.seqera.io -> https://cloud.seqera.io
-     *   https://api.cloud.stage-seqera.io -> https://cloud.stage-seqera.io
-     *   https://tower.example.com/api -> https://tower.example.com
+     * Run the main log polling loop
+     */
+    private void runLogPollingLoop(String workflowId, Map queryParams, String accessToken,
+                                    String apiEndpoint, AtomicBoolean shouldExit) {
+        def displayedLogCount = 0
+        def firstLogReceived = false
+        def workflowFinished = false
+        def workflowFinishedTime = 0L
+        final finalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'UNKNOWN'] as Set<String>
+
+        while (!shouldExit.get()) {
+            try {
+                // Fetch workflow status and logs
+                final status = fetchWorkflowStatus(workflowId, queryParams, accessToken, apiEndpoint)
+                final logEntries = fetchWorkflowLogs(workflowId, queryParams, accessToken, apiEndpoint)
+
+                // Display new log entries
+                def newDisplayedCount = displayLogEntries(logEntries, displayedLogCount, firstLogReceived, shouldExit)
+                if (newDisplayedCount > displayedLogCount) {
+                    firstLogReceived = true
+                    displayedLogCount = newDisplayedCount
+                }
+
+                // Track workflow completion
+                if (status && finalStatuses.contains(status) && !workflowFinished) {
+                    log.debug "Workflow reached final status: ${status}, continuing to poll for ${LOG_GRACE_PERIOD_MS}ms to capture remaining logs"
+                    workflowFinished = true
+                    workflowFinishedTime = System.currentTimeMillis()
+                }
+
+                // Stop after grace period
+                if (workflowFinished && (System.currentTimeMillis() - workflowFinishedTime) > LOG_GRACE_PERIOD_MS) {
+                    log.debug "Grace period elapsed, stopping log polling"
+                    break
+                }
+
+                // Wait before next poll
+                sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
+
+            } catch (Exception e) {
+                if (shouldExit.get()) break
+                log.error "Error polling workflow logs: ${e.message}", e
+                sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
+            }
+        }
+    }
+
+    /**
+     * Fetch workflow status from API
+     */
+    private String fetchWorkflowStatus(String workflowId, Map queryParams, String accessToken, String apiEndpoint) {
+        final workflowResponse = apiGet("/workflow/${workflowId}", queryParams, accessToken, apiEndpoint)
+        final workflow = workflowResponse.workflow as Map
+        final status = workflow?.status as String
+        log.debug "Workflow status: ${status}"
+        return status
+    }
+
+    /**
+     * Fetch workflow logs from API
+     */
+    private List<String> fetchWorkflowLogs(String workflowId, Map queryParams, String accessToken, String apiEndpoint) {
+        final logResponse = apiGet("/workflow/${workflowId}/log", queryParams, accessToken, apiEndpoint)
+        final logData = logResponse.log as Map
+        return logData?.entries as List<String> ?: []
+    }
+
+    /**
+     * Display new log entries and return new count
+     */
+    private int displayLogEntries(List<String> allEntries, int currentCount, boolean firstReceived, AtomicBoolean shouldExit) {
+        if (!allEntries || allEntries.size() <= currentCount) {
+            // No new entries - show progress dots
+            if (!firstReceived && ColorUtil.isAnsiEnabled()) {
+                print(ColorUtil.colorize(".", "dim", true))
+                System.out.flush()
+            }
+            return currentCount
+        }
+
+        // Print separator on first log entry
+        if (!firstReceived && ColorUtil.isAnsiEnabled()) {
+            println "\n"
+            print('─' * 70)
+            println "\n"
+        }
+
+        // Display new entries
+        final newEntries = allEntries.subList(currentCount, allEntries.size())
+        for (String entry : newEntries) {
+            if (shouldExit.get()) break
+            println entry
+        }
+
+        return allEntries.size()
+    }
+
+    /**
+     * Sleep with ability to be interrupted by exit flag
+     */
+    private void sleepInterruptibly(int milliseconds, AtomicBoolean shouldExit) {
+        final iterations = milliseconds / LOG_SLEEP_INTERVAL_MS
+        for (int i = 0; i < iterations && !shouldExit.get(); i++) {
+            Thread.sleep(LOG_SLEEP_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Print message at start of log polling
+     */
+    private void printLogPollingStartMessage() {
+        if (ColorUtil.isAnsiEnabled()) {
+            print(ColorUtil.colorize("Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c", "dim"))
+        } else {
+            log.info "Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c"
+        }
+    }
+
+    /**
+     * Print exit message when log polling is interrupted
+     */
+    private void printLogPollingExitMessage(String trackingUrl) {
+        if (ColorUtil.isAnsiEnabled()) {
+            println ""
+            println "Exiting log viewer."
+            if (trackingUrl) {
+                print(ColorUtil.colorize("⚠️ Workflow is still running in Seqera Platform: ", "yellow bold"))
+                ColorUtil.printColored(trackingUrl, "cyan")
+            }
+        } else {
+            log.info "Exiting log viewer."
+            if (trackingUrl) {
+                log.info "Workflow is still running in Seqera Platform: ${trackingUrl}"
+            }
+        }
+    }
+
+    /**
+     * Remove shutdown hook if we exit normally
+     */
+    private void removeShutdownHook(Thread shutdownHook) {
+        try {
+            Runtime.getRuntime().removeShutdownHook(shutdownHook)
+        } catch (IllegalStateException e) {
+            // Shutdown hook already executed, ignore
+        }
+    }
+
+    // ===== Parameter & Config Parsing Methods =====
+
+    /**
+     * Build parameters JSON text from CLI params and params file
      */
     private String buildParamsText(Map<String, String> params, String paramsFile) {
         final result = [:]
@@ -640,6 +784,21 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         return str
     }
 
+    // ===== Utility Methods =====
+
+    /**
+     * Check if a path is a local file path (vs remote repository)
+     */
+    private static boolean isLocalPath(String path) {
+        if (path.startsWith('/') || path.startsWith('./') || path.startsWith('../')) {
+            return true
+        }
+        if (path.contains('\\') || path ==~ /^[A-Za-z]:.*/) {
+            return true
+        }
+        return false
+    }
+
     /**
      * Resolve pipeline name to full repository URL using AssetManager
      */
@@ -715,6 +874,8 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
         return url.toString()
     }
+
+    // ===== Workspace & User Helper Methods =====
 
     private Long resolveWorkspaceId(Map config, String workspaceName, String accessToken, String apiEndpoint) {
         // First check config for workspace ID
