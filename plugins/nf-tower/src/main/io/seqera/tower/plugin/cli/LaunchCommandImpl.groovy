@@ -200,7 +200,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         }
 
         // Print launch info line
-        printLaunchInfo(actualRepo, actualRunName, commitId, actualRevision, workDir, computeEnvInfo.name as String, orgName, workspaceName, options)
+        printLaunchInfo(actualRepo, actualRunName, commitId, actualRevision, workDir, computeEnvInfo.name as String, userName, orgName, workspaceName, options)
 
         // Construct and display tracking URL
         def trackingUrl = null
@@ -243,7 +243,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         }
     }
 
-    protected void printLaunchInfo(String repo, String runName, String commitId, String revision, String workDir, String computeEnvName, String orgName, String workspaceName, CmdLaunch.LaunchOptions options) {
+    protected void printLaunchInfo(String repo, String runName, String commitId, String revision, String workDir, String computeEnvName, String userName, String orgName, String workspaceName, CmdLaunch.LaunchOptions options) {
         def showRevision = commitId && commitId != 'unknown'
         def showRevisionBrackets = revision && revision != 'unknown'
 
@@ -273,6 +273,11 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
             }
             println ""
 
+            // Print username
+            if (userName) {
+                println(" 👤 user: ${ColorUtil.colorize(userName, 'cyan', true)}")
+            }
+
             // Print workspace
             if (orgName && workspaceName) {
                 println(" 🏢 workspace: ${ColorUtil.colorize(orgName + ' / ' + workspaceName, 'cyan', true)}")
@@ -294,6 +299,9 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
                 plainMsg += " [${revision}]"
             }
             log.info plainMsg
+            if (userName) {
+                log.info " user: ${userName}"
+            }
             if (orgName && workspaceName) {
                 log.info " workspace: ${orgName} / ${workspaceName}"
             } else {
