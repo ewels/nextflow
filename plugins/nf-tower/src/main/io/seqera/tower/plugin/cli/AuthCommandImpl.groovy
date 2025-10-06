@@ -6,6 +6,7 @@ import groovy.transform.Canonical
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import io.seqera.http.HxClient
+import io.seqera.tower.plugin.TowerClient
 import nextflow.Const
 import nextflow.SysEnv
 import nextflow.cli.CmdAuth
@@ -30,7 +31,6 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
     static final int AUTH_POLL_TIMEOUT_RETRIES = 60
     static final int AUTH_POLL_INTERVAL_SECONDS = 5
     static final int WORKSPACE_SELECTION_THRESHOLD = 8  // Max workspaces to show in single list; above this uses org-first selection
-    private static final String DEFAULT_API_ENDPOINT = 'https://api.cloud.seqera.io'
 
     private static final Map SEQERA_API_TO_AUTH0 = [
         'https://api.cloud.dev-seqera.io'  : [
@@ -335,7 +335,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
 
     private String normalizeApiUrl(String url) {
         if( !url ) {
-            return DEFAULT_API_ENDPOINT
+            return TowerClient.DEF_ENDPOINT_URL
         }
         if( !url.startsWith('http://') && !url.startsWith('https://') ) {
             return 'https://' + url
@@ -392,7 +392,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         // Read token from seqera_auth.config file
         final authConfig = readAuthFile()
         final existingToken = authConfig['tower.accessToken']
-        final apiUrl = authConfig['tower.endpoint'] as String ?: DEFAULT_API_ENDPOINT
+        final apiUrl = authConfig['tower.endpoint'] as String ?: TowerClient.DEF_ENDPOINT_URL
 
         if( !existingToken ) {
             ColorUtil.printColored("WARN: No authentication token found in auth file.", "yellow bold")
@@ -516,7 +516,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
 
         // Token can come from seqera_auth.config file or environment variable
         final existingToken = config['tower.accessToken'] ?: SysEnv.get('TOWER_ACCESS_TOKEN')
-        final endpoint = config['tower.endpoint'] ?: DEFAULT_API_ENDPOINT
+        final endpoint = config['tower.endpoint'] ?: TowerClient.DEF_ENDPOINT_URL
 
         if( !existingToken ) {
             println "No authentication found. Please run ${ColorUtil.colorize('nextflow auth login', 'cyan')} first."
@@ -964,7 +964,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         final status = new ConfigStatus([], null, null)
 
         // API endpoint
-        final endpointInfo = getConfigValue(config, authConfig, 'tower.endpoint', 'TOWER_API_ENDPOINT', DEFAULT_API_ENDPOINT)
+        final endpointInfo = getConfigValue(config, authConfig, 'tower.endpoint', 'TOWER_API_ENDPOINT', TowerClient.DEF_ENDPOINT_URL)
         status.table.add(['API endpoint', ColorUtil.colorize(endpointInfo.value as String, 'magenta'), endpointInfo.source as String])
 
         // API connection check

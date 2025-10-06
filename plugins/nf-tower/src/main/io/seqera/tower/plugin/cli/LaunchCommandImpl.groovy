@@ -21,6 +21,7 @@ import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import io.seqera.http.HxClient
+import io.seqera.tower.plugin.TowerClient
 import nextflow.BuildInfo
 import nextflow.cli.CmdLaunch
 import nextflow.cli.ColorUtil
@@ -51,7 +52,6 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     static final public List<String> VALID_PARAMS_FILE = ['json', 'yml', 'yaml']
     static final private Pattern DOT_ESCAPED = ~/\\\./
     static final private Pattern DOT_NOT_ESCAPED = ~/(?<!\\)\./
-    static final private String DEFAULT_API_ENDPOINT = 'https://api.cloud.seqera.io'
     static final int API_TIMEOUT_MS = 10000
 
     // Delegate to AuthCommandImpl for shared authentication and API functionality
@@ -78,7 +78,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
         // Load configuration to get authentication and endpoint
         final config = authHelper.readConfig()
-        final apiEndpoint = (config['tower.endpoint'] ?: DEFAULT_API_ENDPOINT) as String
+        final apiEndpoint = (config['tower.endpoint'] ?: TowerClient.DEF_ENDPOINT_URL) as String
         final accessToken = config['tower.accessToken'] as String
 
         if (!accessToken) {
