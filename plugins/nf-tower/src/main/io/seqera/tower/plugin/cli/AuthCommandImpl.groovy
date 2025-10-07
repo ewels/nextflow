@@ -6,6 +6,7 @@ import groovy.transform.Canonical
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import io.seqera.http.HxClient
+import io.seqera.tower.plugin.TowerClient
 import nextflow.Const
 import nextflow.SysEnv
 import nextflow.cli.CmdAuth
@@ -30,7 +31,6 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
     static final int AUTH_POLL_TIMEOUT_RETRIES = 60
     static final int AUTH_POLL_INTERVAL_SECONDS = 5
     static final int WORKSPACE_SELECTION_THRESHOLD = 8  // Max workspaces to show in single list; above this uses org-first selection
-    private static final String DEFAULT_API_ENDPOINT = 'https://api.cloud.seqera.io'
 
     private static final Map SEQERA_API_TO_AUTH0 = [
         'https://api.cloud.dev-seqera.io'  : [
@@ -230,45 +230,57 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
     private Map pollForDeviceToken(String deviceCode, int intervalSeconds, Map auth0Config) {
         final tokenUrl = "https://${auth0Config.domain}/oauth/token"
         def retryCount = 0
+        def spinner = new SpinnerUtil("Waiting for authentication...")
 
-        while( retryCount < AUTH_POLL_TIMEOUT_RETRIES ) {
-            // Check for interrupt
-            if( Thread.currentThread().isInterrupted() ) {
-                throw new InterruptedException("Authentication polling interrupted")
-            }
+        try {
+            spinner.start()
 
-            final params = [
-                'grant_type' : 'urn:ietf:params:oauth:grant-type:device_code',
-                'device_code': deviceCode,
-                'client_id'  : auth0Config.clientId
-            ]
-
-            try {
-                final result = performAuth0Request(tokenUrl, params)
-                return result
-            } catch( RuntimeException e ) {
-                final message = e.message
-                if( message.contains('authorization_pending') ) {
-                    print "${ColorUtil.colorize('.', 'dim', true)}"
-                    System.out.flush()
-                } else if( message.contains('slow_down') ) {
-                    intervalSeconds += 5
-                    print "${ColorUtil.colorize('.', 'dim', true)}"
-                    System.out.flush()
-                } else if( message.contains('expired_token') ) {
-                    throw new RuntimeException("The device code has expired. Please try again.")
-                } else if( message.contains('access_denied') ) {
-                    throw new RuntimeException("Access denied by user")
-                } else {
-                    throw e
+            while( retryCount < AUTH_POLL_TIMEOUT_RETRIES ) {
+                // Check for interrupt
+                if( Thread.currentThread().isInterrupted() ) {
+                    throw new InterruptedException("Authentication polling interrupted")
                 }
+
+                final params = [
+                    'grant_type' : 'urn:ietf:params:oauth:grant-type:device_code',
+                    'device_code': deviceCode,
+                    'client_id'  : auth0Config.clientId
+                ]
+
+                try {
+                    final result = performAuth0Request(tokenUrl, params)
+                    spinner.stop()
+                    return result
+                } catch( RuntimeException e ) {
+                    final message = e.message
+                    if( message.contains('authorization_pending') ) {
+                        // Continue waiting - spinner already shows progress
+                    } else if( message.contains('slow_down') ) {
+                        intervalSeconds += 5
+                        spinner.updateMessage("Waiting for authentication (slowing down polling)...")
+                    } else if( message.contains('expired_token') ) {
+                        spinner.stop()
+                        throw new RuntimeException("The device code has expired. Please try again.")
+                    } else if( message.contains('access_denied') ) {
+                        spinner.stop()
+                        throw new RuntimeException("Access denied by user")
+                    } else {
+                        spinner.stop()
+                        throw e
+                    }
+                }
+
+                Thread.sleep(intervalSeconds * 1000)
+                retryCount++
             }
 
-            Thread.sleep(intervalSeconds * 1000)
-            retryCount++
+            spinner.stop()
+            throw new RuntimeException("Authentication timed out. Please try again.")
+        } finally {
+            if( spinner.isRunning() ) {
+                spinner.stop()
+            }
         }
-
-        throw new RuntimeException("Authentication timed out. Please try again.")
     }
 
 
@@ -289,7 +301,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         ColorUtil.printColored("Personal Access Token saved to Nextflow auth config (${getAuthFile().toString()})", "green")
     }
 
-    private String getWebUrlFromApiEndpoint(String apiEndpoint) {
+    protected String getWebUrlFromApiEndpoint(String apiEndpoint) {
         // Convert API endpoint to web URL
         // e.g., https://api.cloud.seqera.io -> https://cloud.seqera.io
         //      https://cloud.seqera.io/api -> https://cloud.seqera.io
@@ -335,7 +347,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
 
     private String normalizeApiUrl(String url) {
         if( !url ) {
-            return DEFAULT_API_ENDPOINT
+            return TowerClient.DEF_ENDPOINT_URL
         }
         if( !url.startsWith('http://') && !url.startsWith('https://') ) {
             return 'https://' + url
@@ -392,7 +404,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         // Read token from seqera_auth.config file
         final authConfig = readAuthFile()
         final existingToken = authConfig['tower.accessToken']
-        final apiUrl = authConfig['tower.endpoint'] as String ?: DEFAULT_API_ENDPOINT
+        final apiUrl = authConfig['tower.endpoint'] as String ?: TowerClient.DEF_ENDPOINT_URL
 
         if( !existingToken ) {
             ColorUtil.printColored("WARN: No authentication token found in auth file.", "yellow bold")
@@ -516,7 +528,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
 
         // Token can come from seqera_auth.config file or environment variable
         final existingToken = config['tower.accessToken'] ?: SysEnv.get('TOWER_ACCESS_TOKEN')
-        final endpoint = config['tower.endpoint'] ?: DEFAULT_API_ENDPOINT
+        final endpoint = config['tower.endpoint'] ?: TowerClient.DEF_ENDPOINT_URL
 
         if( !existingToken ) {
             println "No authentication found. Please run ${ColorUtil.colorize('nextflow auth login', 'cyan')} first."
@@ -777,7 +789,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         return [changed: currentId != selectedId, metadata: metadata]
     }
 
-    private List getUserWorkspaces(String accessToken, String endpoint, String userId) {
+    protected List getUserWorkspaces(String accessToken, String endpoint, String userId) {
         final client = createHttpClient(accessToken)
         final request = HttpRequest.newBuilder()
             .uri(URI.create("${endpoint}/user/${userId}/workspaces"))
@@ -964,7 +976,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         final status = new ConfigStatus([], null, null)
 
         // API endpoint
-        final endpointInfo = getConfigValue(config, authConfig, 'tower.endpoint', 'TOWER_API_ENDPOINT', DEFAULT_API_ENDPOINT)
+        final endpointInfo = getConfigValue(config, authConfig, 'tower.endpoint', 'TOWER_API_ENDPOINT', TowerClient.DEF_ENDPOINT_URL)
         status.table.add(['API endpoint', ColorUtil.colorize(endpointInfo.value as String, 'magenta'), endpointInfo.source as String])
 
         // API connection check
@@ -1073,7 +1085,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         tableLines.each { println it }
     }
 
-    private List<String> generateStatusTableLines(List<List<String>> rows) {
+    protected List<String> generateStatusTableLines(List<List<String>> rows) {
         if( !rows ) return []
 
         final List<String> lines = []
@@ -1267,7 +1279,7 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
         }
     }
 
-    private Map readConfig() {
+    protected Map readConfig() {
         final builder = new ConfigBuilder().setHomeDir(Const.APP_HOME_DIR).setCurrentDir(Const.APP_HOME_DIR)
         return builder.buildConfigObject().flatten()
     }
