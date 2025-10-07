@@ -55,6 +55,7 @@ class SpinnerUtil {
 
     private static final String[] SPINNER_CHARS_RUNNING = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as String[]
     private static final String[] SPINNER_CHARS_WAITING = ['⠋', '⠙', '⠹', '⠸', '⠹', '⠙', '⠋', '⠏', '⠇', '⠏'] as String[]
+    private static final String[] SPINNER_CHARS_FINISHED = ['⢀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⠿', '⠟', '⠛', '⠙', '⠉', '⠁', '⠀'] as String[]
     private static final int SPINNER_UPDATE_MS = 100 // Update spinner every 100ms for smooth animation
 
     private final AtomicBoolean shouldStop = new AtomicBoolean(false)
@@ -140,6 +141,33 @@ class SpinnerUtil {
         this.message = newMessage
         this.colorName = newColorName
         this.spinnerChars = waiting ? SPINNER_CHARS_WAITING : SPINNER_CHARS_RUNNING
+        this.spinnerIndex = 0 // Reset animation when changing mode
+    }
+
+    /**
+     * Update the message, color, and mode of the spinner with string mode
+     *
+     * @param newMessage The new message to display
+     * @param newColorName The new color name for the spinner character (e.g., 'yellow', 'blue', 'red')
+     * @param mode The spinner mode: 'waiting', 'running', or 'finished'
+     */
+    void updateMessage(String newMessage, String newColorName, String mode) {
+        this.message = newMessage
+        this.colorName = newColorName
+
+        switch (mode) {
+            case 'waiting':
+                this.spinnerChars = SPINNER_CHARS_WAITING
+                break
+            case 'finished':
+                this.spinnerChars = SPINNER_CHARS_FINISHED
+                break
+            case 'running':
+            default:
+                this.spinnerChars = SPINNER_CHARS_RUNNING
+                break
+        }
+
         this.spinnerIndex = 0 // Reset animation when changing mode
     }
 

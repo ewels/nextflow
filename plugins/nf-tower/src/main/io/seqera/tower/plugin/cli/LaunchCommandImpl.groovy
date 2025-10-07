@@ -512,8 +512,8 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
                     // Update spinner with status if it changed
                     if (status && status != lastStatus) {
-                        def isWaiting = (status == 'PENDING' || status == 'SUBMITTED')
-                        spinner.updateMessage(formatWorkflowStatus(status), getColorForStatus(status), isWaiting)
+                        def spinnerMode = getSpinnerMode(status, workflowFinished)
+                        spinner.updateMessage(formatWorkflowStatus(status), getColorForStatus(status), spinnerMode)
                         lastStatus = status
                     }
 
@@ -571,6 +571,26 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     }
 
     /**
+     * Get the spinner mode for a workflow status
+     */
+    private String getSpinnerMode(String status, boolean workflowFinished) {
+        if (!status) return 'waiting'
+
+        // Use finished animation for final statuses
+        if (status == 'SUCCEEDED' || status == 'FAILED' || status == 'CANCELLED' || status == 'ABORTED' || status == 'UNKNOWN') {
+            return 'finished'
+        }
+
+        // Use waiting animation for pending/submitted
+        if (status == 'PENDING' || status == 'SUBMITTED') {
+            return 'waiting'
+        }
+
+        // Use running animation for all other active states (RUNNING, etc.)
+        return 'running'
+    }
+
+    /**
      * Get the color name for a workflow status
      */
     private String getColorForStatus(String status) {
@@ -584,10 +604,10 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
                 return 'blue'
             case 'FAILED':
             case 'ABORTED':
+            case 'CANCELLED':
                 return 'red'
             case 'SUCCEEDED':
                 return 'green'
-            case 'CANCELLED':
             default:
                 return 'cyan'
         }
