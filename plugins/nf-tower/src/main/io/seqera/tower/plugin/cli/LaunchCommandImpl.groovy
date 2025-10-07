@@ -453,13 +453,16 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
         final queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
         final shouldExit = new AtomicBoolean(false)
-        final shutdownHook = createShutdownHook(shouldExit, trackingUrl)
+        final spinner = new SpinnerUtil("Checking workflow status...")
+        final shutdownHook = createShutdownHook(shouldExit, trackingUrl, spinner)
 
         Runtime.getRuntime().addShutdownHook(shutdownHook)
+
+        // Always print the initial message
         printLogPollingStartMessage()
 
         try {
-            runLogPollingLoop(workflowId, queryParams, accessToken, apiEndpoint, shouldExit)
+            runLogPollingLoop(workflowId, queryParams, accessToken, apiEndpoint, shouldExit, spinner)
         } finally {
             removeShutdownHook(shutdownHook)
         }
@@ -470,10 +473,17 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     /**
      * Create shutdown hook for graceful exit on Ctrl+C
      */
-    private Thread createShutdownHook(AtomicBoolean shouldExit, String trackingUrl) {
+    private Thread createShutdownHook(AtomicBoolean shouldExit, String trackingUrl, SpinnerUtil spinner) {
         return new Thread({
             shouldExit.set(true)
             log.debug "Shutdown hook triggered - setting exit flag"
+
+            // Stop spinner if running
+            if (spinner.isRunning()) {
+                Thread.sleep(50) // Give spinner thread a moment to stop
+                spinner.stop()
+            }
+
             printLogPollingExitMessage(trackingUrl)
         })
     }
@@ -482,46 +492,63 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
      * Run the main log polling loop
      */
     private void runLogPollingLoop(String workflowId, Map queryParams, String accessToken,
-                                    String apiEndpoint, AtomicBoolean shouldExit) {
+                                    String apiEndpoint, AtomicBoolean shouldExit, SpinnerUtil spinner) {
         def displayedLogCount = 0
         def firstLogReceived = false
         def workflowFinished = false
         def workflowFinishedTime = 0L
         final finalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'UNKNOWN'] as Set<String>
+        def lastStatus = null
 
-        while (!shouldExit.get()) {
-            try {
-                // Fetch workflow status and logs
-                final status = fetchWorkflowStatus(workflowId, queryParams, accessToken, apiEndpoint)
-                final logEntries = fetchWorkflowLogs(workflowId, queryParams, accessToken, apiEndpoint)
+        try {
+            spinner.start()
 
-                // Display new log entries
-                def newDisplayedCount = displayLogEntries(logEntries, displayedLogCount, firstLogReceived, shouldExit)
-                if (newDisplayedCount > displayedLogCount) {
-                    firstLogReceived = true
-                    displayedLogCount = newDisplayedCount
+            while (!shouldExit.get()) {
+                try {
+                    // Fetch workflow status and logs
+                    final status = fetchWorkflowStatus(workflowId, queryParams, accessToken, apiEndpoint)
+                    final logEntries = fetchWorkflowLogs(workflowId, queryParams, accessToken, apiEndpoint)
+
+                    // Update spinner with status if it changed
+                    if (status && status != lastStatus && !firstLogReceived) {
+                        spinner.updateMessage("Workflow status: ${status}")
+                        lastStatus = status
+                    }
+
+                    // Display new log entries
+                    def newDisplayedCount = displayLogEntries(logEntries, displayedLogCount, firstLogReceived, shouldExit, spinner)
+                    if (newDisplayedCount > displayedLogCount) {
+                        if (!firstLogReceived) {
+                            firstLogReceived = true
+                        }
+                        displayedLogCount = newDisplayedCount
+                    }
+
+                    // Track workflow completion
+                    if (status && finalStatuses.contains(status) && !workflowFinished) {
+                        log.debug "Workflow reached final status: ${status}, continuing to poll for ${LOG_GRACE_PERIOD_MS}ms to capture remaining logs"
+                        workflowFinished = true
+                        workflowFinishedTime = System.currentTimeMillis()
+                    }
+
+                    // Stop after grace period
+                    if (workflowFinished && (System.currentTimeMillis() - workflowFinishedTime) > LOG_GRACE_PERIOD_MS) {
+                        log.debug "Grace period elapsed, stopping log polling"
+                        break
+                    }
+
+                    // Wait before next poll
+                    sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
+
+                } catch (Exception e) {
+                    if (shouldExit.get()) break
+                    log.error "Error polling workflow logs: ${e.message}", e
+                    sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
                 }
-
-                // Track workflow completion
-                if (status && finalStatuses.contains(status) && !workflowFinished) {
-                    log.debug "Workflow reached final status: ${status}, continuing to poll for ${LOG_GRACE_PERIOD_MS}ms to capture remaining logs"
-                    workflowFinished = true
-                    workflowFinishedTime = System.currentTimeMillis()
-                }
-
-                // Stop after grace period
-                if (workflowFinished && (System.currentTimeMillis() - workflowFinishedTime) > LOG_GRACE_PERIOD_MS) {
-                    log.debug "Grace period elapsed, stopping log polling"
-                    break
-                }
-
-                // Wait before next poll
-                sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
-
-            } catch (Exception e) {
-                if (shouldExit.get()) break
-                log.error "Error polling workflow logs: ${e.message}", e
-                sleepInterruptibly(LOG_POLL_INTERVAL_MS, shouldExit)
+            }
+        } finally {
+            if (spinner.isRunning()) {
+                spinner.stop()
             }
         }
     }
@@ -549,21 +576,22 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     /**
      * Display new log entries and return new count
      */
-    private int displayLogEntries(List<String> allEntries, int currentCount, boolean firstReceived, AtomicBoolean shouldExit) {
+    private int displayLogEntries(List<String> allEntries, int currentCount, boolean firstReceived,
+                                   AtomicBoolean shouldExit, SpinnerUtil spinner) {
         if (!allEntries || allEntries.size() <= currentCount) {
-            // No new entries - show progress dots
-            if (!firstReceived && ColorUtil.isAnsiEnabled()) {
-                print(ColorUtil.colorize(".", "dim", true))
-                System.out.flush()
-            }
+            // No new entries - spinner handles the waiting indication
             return currentCount
         }
 
         // Print separator on first log entry
-        if (!firstReceived && ColorUtil.isAnsiEnabled()) {
-            println "\n"
-            print('─' * 70)
-            println "\n"
+        if (!firstReceived) {
+            // Clear spinner and show separator
+            if (spinner.isRunning()) {
+                spinner.stop()
+                println ""
+                println ('─' * 70)
+                println ""
+            }
         }
 
         // Display new entries

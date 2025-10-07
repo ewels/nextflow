@@ -230,45 +230,57 @@ class AuthCommandImpl implements CmdAuth.AuthCommand {
     private Map pollForDeviceToken(String deviceCode, int intervalSeconds, Map auth0Config) {
         final tokenUrl = "https://${auth0Config.domain}/oauth/token"
         def retryCount = 0
+        def spinner = new SpinnerUtil("Waiting for authentication...")
 
-        while( retryCount < AUTH_POLL_TIMEOUT_RETRIES ) {
-            // Check for interrupt
-            if( Thread.currentThread().isInterrupted() ) {
-                throw new InterruptedException("Authentication polling interrupted")
-            }
+        try {
+            spinner.start()
 
-            final params = [
-                'grant_type' : 'urn:ietf:params:oauth:grant-type:device_code',
-                'device_code': deviceCode,
-                'client_id'  : auth0Config.clientId
-            ]
-
-            try {
-                final result = performAuth0Request(tokenUrl, params)
-                return result
-            } catch( RuntimeException e ) {
-                final message = e.message
-                if( message.contains('authorization_pending') ) {
-                    print "${ColorUtil.colorize('.', 'dim', true)}"
-                    System.out.flush()
-                } else if( message.contains('slow_down') ) {
-                    intervalSeconds += 5
-                    print "${ColorUtil.colorize('.', 'dim', true)}"
-                    System.out.flush()
-                } else if( message.contains('expired_token') ) {
-                    throw new RuntimeException("The device code has expired. Please try again.")
-                } else if( message.contains('access_denied') ) {
-                    throw new RuntimeException("Access denied by user")
-                } else {
-                    throw e
+            while( retryCount < AUTH_POLL_TIMEOUT_RETRIES ) {
+                // Check for interrupt
+                if( Thread.currentThread().isInterrupted() ) {
+                    throw new InterruptedException("Authentication polling interrupted")
                 }
+
+                final params = [
+                    'grant_type' : 'urn:ietf:params:oauth:grant-type:device_code',
+                    'device_code': deviceCode,
+                    'client_id'  : auth0Config.clientId
+                ]
+
+                try {
+                    final result = performAuth0Request(tokenUrl, params)
+                    spinner.stop()
+                    return result
+                } catch( RuntimeException e ) {
+                    final message = e.message
+                    if( message.contains('authorization_pending') ) {
+                        // Continue waiting - spinner already shows progress
+                    } else if( message.contains('slow_down') ) {
+                        intervalSeconds += 5
+                        spinner.updateMessage("Waiting for authentication (slowing down polling)...")
+                    } else if( message.contains('expired_token') ) {
+                        spinner.stop()
+                        throw new RuntimeException("The device code has expired. Please try again.")
+                    } else if( message.contains('access_denied') ) {
+                        spinner.stop()
+                        throw new RuntimeException("Access denied by user")
+                    } else {
+                        spinner.stop()
+                        throw e
+                    }
+                }
+
+                Thread.sleep(intervalSeconds * 1000)
+                retryCount++
             }
 
-            Thread.sleep(intervalSeconds * 1000)
-            retryCount++
+            spinner.stop()
+            throw new RuntimeException("Authentication timed out. Please try again.")
+        } finally {
+            if( spinner.isRunning() ) {
+                spinner.stop()
+            }
         }
-
-        throw new RuntimeException("Authentication timed out. Please try again.")
     }
 
 
