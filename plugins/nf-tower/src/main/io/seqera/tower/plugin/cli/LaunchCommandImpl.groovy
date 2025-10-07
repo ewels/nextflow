@@ -453,13 +453,13 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
 
         final queryParams = workspaceId ? [workspaceId: workspaceId.toString()] : [:]
         final shouldExit = new AtomicBoolean(false)
-        final spinner = new SpinnerUtil("Checking workflow status...")
+        final spinner = new SpinnerUtil("Checking workflow status...", true) // Use waiting animation initially
         final shutdownHook = createShutdownHook(shouldExit, trackingUrl, spinner)
 
         Runtime.getRuntime().addShutdownHook(shutdownHook)
 
-        // Always print the initial message
-        printLogPollingStartMessage()
+        log.info "Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c\n"
+        println "\n" + ('─' * 70)
 
         try {
             runLogPollingLoop(workflowId, queryParams, accessToken, apiEndpoint, shouldExit, spinner)
@@ -497,8 +497,9 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         def firstLogReceived = false
         def workflowFinished = false
         def workflowFinishedTime = 0L
-        final finalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'UNKNOWN'] as Set<String>
+        final finalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'UNKNOWN', 'ABORTED'] as Set<String>
         def lastStatus = null
+        def finalStatus = null
 
         try {
             spinner.start()
@@ -510,8 +511,9 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
                     final logEntries = fetchWorkflowLogs(workflowId, queryParams, accessToken, apiEndpoint)
 
                     // Update spinner with status if it changed
-                    if (status && status != lastStatus && !firstLogReceived) {
-                        spinner.updateMessage("Workflow status: ${status}")
+                    if (status && status != lastStatus) {
+                        def isWaiting = (status == 'PENDING' || status == 'SUBMITTED')
+                        spinner.updateMessage(formatWorkflowStatus(status), getColorForStatus(status), isWaiting)
                         lastStatus = status
                     }
 
@@ -529,6 +531,7 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
                         log.debug "Workflow reached final status: ${status}, continuing to poll for ${LOG_GRACE_PERIOD_MS}ms to capture remaining logs"
                         workflowFinished = true
                         workflowFinishedTime = System.currentTimeMillis()
+                        finalStatus = status
                     }
 
                     // Stop after grace period
@@ -549,8 +552,57 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         } finally {
             if (spinner.isRunning()) {
                 spinner.stop()
+                // Clear the separator line that was above the spinner
+                if (ColorUtil.isAnsiEnabled() && firstLogReceived) {
+                    // Move up 2 lines (spinner line + separator line) and clear them
+                    print("\u001B[2A\u001B[0J")
+                    System.out.flush()
+                }
+            }
+
+            // Print final status after logs
+            if (finalStatus && firstLogReceived) {
+                println ""
+                println ('─' * 70)
+                println ""
+                println formatWorkflowStatus(finalStatus)
             }
         }
+    }
+
+    /**
+     * Get the color name for a workflow status
+     */
+    private String getColorForStatus(String status) {
+        if (!status) return 'cyan'
+
+        switch (status) {
+            case 'PENDING':
+            case 'SUBMITTED':
+                return 'yellow'
+            case 'RUNNING':
+                return 'blue'
+            case 'FAILED':
+            case 'ABORTED':
+                return 'red'
+            case 'SUCCEEDED':
+                return 'green'
+            case 'CANCELLED':
+            default:
+                return 'cyan'
+        }
+    }
+
+    /**
+     * Format workflow status with appropriate color
+     */
+    private String formatWorkflowStatus(String status) {
+        if (!status) return ""
+
+        def colorName = getColorForStatus(status)
+        def coloredStatus = (colorName == 'cyan') ? status : ColorUtil.colorize(status, colorName)
+
+        return "Workflow status: ${coloredStatus} "
     }
 
     /**
@@ -583,15 +635,23 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
             return currentCount
         }
 
+        // Stop spinner and clear separator line if it was running
+        def wasRunning = spinner.isRunning()
+        if (wasRunning) {
+            spinner.stop()
+            // Clear the separator line that was above the spinner
+            if (ColorUtil.isAnsiEnabled()) {
+                // Move up 2 lines (spinner line + separator line) and clear them
+                print("\u001B[2A\u001B[0J")
+                System.out.flush()
+            }
+        }
+
         // Print separator on first log entry
         if (!firstReceived) {
-            // Clear spinner and show separator
-            if (spinner.isRunning()) {
-                spinner.stop()
-                println ""
-                println ('─' * 70)
-                println ""
-            }
+            println ""
+            println ('─' * 70)
+            println ""
         }
 
         // Display new entries
@@ -599,6 +659,13 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         for (String entry : newEntries) {
             if (shouldExit.get()) break
             println entry
+        }
+
+        // Restart spinner below the logs with separator
+        if (wasRunning && !shouldExit.get()) {
+            println ""
+            println ('─' * 70)
+            spinner.start()
         }
 
         return allEntries.size()
@@ -611,17 +678,6 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
         final iterations = milliseconds / LOG_SLEEP_INTERVAL_MS
         for (int i = 0; i < iterations && !shouldExit.get(); i++) {
             Thread.sleep(LOG_SLEEP_INTERVAL_MS)
-        }
-    }
-
-    /**
-     * Print message at start of log polling
-     */
-    private void printLogPollingStartMessage() {
-        if (ColorUtil.isAnsiEnabled()) {
-            print(ColorUtil.colorize("Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c", "dim"))
-        } else {
-            log.info "Workflow submitted, awaiting log output. It is now safe to exit with ctrl+c"
         }
     }
 

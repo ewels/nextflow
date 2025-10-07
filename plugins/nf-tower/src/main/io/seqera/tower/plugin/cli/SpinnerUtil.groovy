@@ -53,11 +53,14 @@ import static org.fusesource.jansi.Ansi.Erase
 @CompileStatic
 class SpinnerUtil {
 
-    private static final String[] SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as String[]
+    private static final String[] SPINNER_CHARS_RUNNING = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as String[]
+    private static final String[] SPINNER_CHARS_WAITING = ['⠋', '⠙', '⠹', '⠸', '⠹', '⠙', '⠋', '⠏', '⠇', '⠏'] as String[]
     private static final int SPINNER_UPDATE_MS = 100 // Update spinner every 100ms for smooth animation
 
     private final AtomicBoolean shouldStop = new AtomicBoolean(false)
     private String message
+    private String colorName
+    private String[] spinnerChars
     private Thread spinnerThread
     private final boolean ansiEnabled
     private volatile int spinnerIndex = 0
@@ -66,9 +69,12 @@ class SpinnerUtil {
      * Create a new spinner with the given message
      *
      * @param message The message to display next to the spinner
+     * @param waiting If true, use waiting animation; if false, use running animation (default)
      */
-    SpinnerUtil(String message) {
+    SpinnerUtil(String message, boolean waiting = false) {
         this.message = message
+        this.colorName = 'cyan'
+        this.spinnerChars = waiting ? SPINNER_CHARS_WAITING : SPINNER_CHARS_RUNNING
         this.ansiEnabled = ColorUtil.isAnsiEnabled()
     }
 
@@ -86,11 +92,11 @@ class SpinnerUtil {
                 while (!shouldStop.get()) {
                     def fmt = Ansi.ansi()
                     fmt.a("\r").eraseLine(Erase.ALL)
-                    fmt.fg(Ansi.Color.CYAN).a(SPINNER_CHARS[spinnerIndex]).reset()
+                    fmt.fg(parseColor(colorName)).a(spinnerChars[spinnerIndex]).reset()
                     fmt.a(" ").a(message)
                     AnsiConsole.out.print(fmt.toString())
                     AnsiConsole.out.flush()
-                    spinnerIndex = (spinnerIndex + 1) % SPINNER_CHARS.length
+                    spinnerIndex = (spinnerIndex + 1) % spinnerChars.length
                     Thread.sleep(SPINNER_UPDATE_MS)
                 }
             } catch (InterruptedException e) {
@@ -110,6 +116,49 @@ class SpinnerUtil {
      */
     void updateMessage(String newMessage) {
         this.message = newMessage
+    }
+
+    /**
+     * Update the message and color of the spinner
+     *
+     * @param newMessage The new message to display
+     * @param newColorName The new color name for the spinner character (e.g., 'yellow', 'blue', 'red')
+     */
+    void updateMessage(String newMessage, String newColorName) {
+        this.message = newMessage
+        this.colorName = newColorName
+    }
+
+    /**
+     * Update the message, color, and mode of the spinner
+     *
+     * @param newMessage The new message to display
+     * @param newColorName The new color name for the spinner character (e.g., 'yellow', 'blue', 'red')
+     * @param waiting If true, use waiting animation; if false, use running animation
+     */
+    void updateMessage(String newMessage, String newColorName, boolean waiting) {
+        this.message = newMessage
+        this.colorName = newColorName
+        this.spinnerChars = waiting ? SPINNER_CHARS_WAITING : SPINNER_CHARS_RUNNING
+        this.spinnerIndex = 0 // Reset animation when changing mode
+    }
+
+    /**
+     * Parse color name to Jansi Color enum
+     */
+    private static Ansi.Color parseColor(String colorName) {
+        switch (colorName) {
+            case 'black': return Ansi.Color.BLACK
+            case 'red': return Ansi.Color.RED
+            case 'green': return Ansi.Color.GREEN
+            case 'yellow': return Ansi.Color.YELLOW
+            case 'blue': return Ansi.Color.BLUE
+            case 'magenta': return Ansi.Color.MAGENTA
+            case 'cyan': return Ansi.Color.CYAN
+            case 'white': return Ansi.Color.WHITE
+            case 'default': return Ansi.Color.DEFAULT
+            default: return Ansi.Color.CYAN
+        }
     }
 
     /**
