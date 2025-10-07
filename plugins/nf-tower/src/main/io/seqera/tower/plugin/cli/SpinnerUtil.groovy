@@ -53,9 +53,10 @@ import static org.fusesource.jansi.Ansi.Erase
 @CompileStatic
 class SpinnerUtil {
 
+    private static final String[] SPINNER_CHARS_WAITING = ['⠋', '⠉', '⠙', '⠘', '⠐', '⠘', '⠙', '⠉', '⠋', '⠃', '⠂', '⠃'] as String[]
     private static final String[] SPINNER_CHARS_RUNNING = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as String[]
-    private static final String[] SPINNER_CHARS_WAITING = ['⠋', '⠙', '⠹', '⠸', '⠹', '⠙', '⠋', '⠏', '⠇', '⠏'] as String[]
-    private static final String[] SPINNER_CHARS_FINISHED = ['⢀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⠿', '⠟', '⠛', '⠙', '⠉', '⠁', '⠀'] as String[]
+    private static final String[] SPINNER_CHARS_SUCCEEDED = ['⠀','⠄','⠤','⠦','⠶','⠷','⠿','⠻','⠛','⠙','⠉','⠈'] as String[]
+    private static final String[] SPINNER_CHARS_FAILED = ['⠈', '⠉', '⠙', '⠛', '⠻', '⠿', '⠷', '⠶', '⠦', '⠤', '⠄', '⠀'] as String[]
     private static final int SPINNER_UPDATE_MS = 100 // Update spinner every 100ms for smooth animation
 
     private final AtomicBoolean shouldStop = new AtomicBoolean(false)
@@ -149,7 +150,7 @@ class SpinnerUtil {
      *
      * @param newMessage The new message to display
      * @param newColorName The new color name for the spinner character (e.g., 'yellow', 'blue', 'red')
-     * @param mode The spinner mode: 'waiting', 'running', or 'finished'
+     * @param mode The spinner mode: 'waiting', 'running', 'succeeded', or 'failed'
      */
     void updateMessage(String newMessage, String newColorName, String mode) {
         this.message = newMessage
@@ -159,8 +160,11 @@ class SpinnerUtil {
             case 'waiting':
                 this.spinnerChars = SPINNER_CHARS_WAITING
                 break
-            case 'finished':
-                this.spinnerChars = SPINNER_CHARS_FINISHED
+            case 'succeeded':
+                this.spinnerChars = SPINNER_CHARS_SUCCEEDED
+                break
+            case 'failed':
+                this.spinnerChars = SPINNER_CHARS_FAILED
                 break
             case 'running':
             default:

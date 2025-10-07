@@ -561,11 +561,10 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
             }
 
             // Print final status after logs
-            if (finalStatus && firstLogReceived) {
-                println ""
-                println ('─' * 70)
-                println ""
-                println formatWorkflowStatus(finalStatus)
+            if (finalStatus) {
+                def colorName = getColorForStatus(finalStatus)
+                def coloredIcon = (colorName == 'cyan') ? '⠿' : ColorUtil.colorize('⠿', colorName)
+                println "${coloredIcon} ${formatWorkflowStatus(finalStatus)}"
             }
         }
     }
@@ -576,9 +575,14 @@ class LaunchCommandImpl implements CmdLaunch.LaunchCommand {
     private String getSpinnerMode(String status, boolean workflowFinished) {
         if (!status) return 'waiting'
 
-        // Use finished animation for final statuses
-        if (status == 'SUCCEEDED' || status == 'FAILED' || status == 'CANCELLED' || status == 'ABORTED' || status == 'UNKNOWN') {
-            return 'finished'
+        // Use succeeded animation for successful completion
+        if (status == 'SUCCEEDED') {
+            return 'succeeded'
+        }
+
+        // Use failed animation for failed/cancelled/aborted statuses
+        if (status == 'FAILED' || status == 'CANCELLED' || status == 'ABORTED' || status == 'UNKNOWN') {
+            return 'failed'
         }
 
         // Use waiting animation for pending/submitted
